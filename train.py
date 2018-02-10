@@ -4,18 +4,23 @@ from tensorflow.python.lib.io import file_io
 from imports.data_utils import create_one_shot_iterator, augment_dataset, create_initializable_iterator
 from imports.losses import loss_fun
 from imports.models import segmentation_block, feathering_block
+from imports.metrics import iou
+
 import os
 import argparse
 
 
 def args_parser():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--mode', default=1, type=int)
     parser.add_argument('--train_files', nargs='+', required=False, default="train-00001-of-00001")
     parser.add_argument('--test_files', nargs='+', required=False, default="val-00001-of-00001")
     parser.add_argument('--log_dir', default='./logs', type=str)
     parser.add_argument('--ckpt_dir', default='./ckpts', type=str)
     parser.add_argument('--train_batch_size', default=256, type=int)
     parser.add_argument('--test_batch_size', default=256, type=int)
+    parser.add_argument('--num_epochs', default=10000, type=int)
+    parser.add_argument('--learning_rate', default=1e-3, type=float)
     parser.add_argument('--resume', default=None, type=int)
     return parser.parse_args()
 
@@ -23,14 +28,9 @@ def args_parser():
 if __name__ == '__main__':
     args = args_parser()
 
-    num_iter_first_state = 20000
-    num_iter_second_stage = 20000
-    num_iter_third_stage = 20000
-
-    lr_first_1 = 1e-3
-    lr_first_2 = 1e-4
-    lr_second = 1e-6
-    lr_third = 1e-7
+    mode = args.mode
+    if mode is None or mode <= 0 or mode > 3:
+        raise Exception("Invalid mode")
 
     train_files = args.train_files
     test_files = args.test_files
@@ -42,9 +42,8 @@ if __name__ == '__main__':
                             for n in tf.python_io.tf_record_iterator(f))
     num_test_samples = sum(1 for f in file_io.get_matching_files(test_files) 
                            for n in tf.python_io.tf_record_iterator(f))
-    
-    num_epochs = int((num_iter_first_state + num_iter_second_stage + num_iter_third_stage) 
-                     // (num_train_samples / train_batch_size))
+
+    num_epochs = args.num_epochs
 
     train_iterator = create_one_shot_iterator(train_files, train_batch_size, num_epoch=num_epochs)
     test_iterator = create_initializable_iterator(test_files, batch_size=num_test_samples)
@@ -61,25 +60,29 @@ if __name__ == '__main__':
     test_alpha_mattes = feathering_block(test_images, test_coarse_masks)
     test_loss = loss_fun(test_images, test_masks, test_alpha_mattes)
 
-    segmentation_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, "segmentation_block/")
-    feathering_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, "feathering_block/")
+    train_iou = iou(next_masks, alpha_mattes)
+    test_iou = iou(test_masks, test_alpha_mattes)
+
     all_trainable_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES)
 
-    train_op_first_stage_1 = tf.train.AdamOptimizer(learning_rate=lr_first_1).minimize(loss, var_list=segmentation_vars)
-    train_op_first_stage_2 = tf.train.AdamOptimizer(learning_rate=lr_first_2).minimize(loss, var_list=segmentation_vars)
-    train_op_second_stage = tf.train.AdamOptimizer(learning_rate=lr_second).minimize(loss, var_list=feathering_vars)
-    train_op_third_stage = tf.train.AdamOptimizer(learning_rate=lr_third).minimize(loss, var_list=all_trainable_vars)
+    train_op = tf.train.AdamOptimizer(learning_rate=args.learning_rate).minimize(loss, var_list=all_trainable_vars)
 
     summary = tf.summary.FileWriter(logdir=args.log_dir)
     image_summary = tf.summary.image("image", next_images)
-    gt_summary = tf.summary.image("gt", next_masks * 255.)
-    coarse_summary = tf.summary.image("coarse", tf.cast(tf.expand_dims(tf.argmax(coarse_masks, axis=3), axis=3),
-                                                        dtype=tf.float32))
-    result_summary = tf.summary.image("result", alpha_mattes * 255.)
-    images_summary = tf.summary.merge([image_summary, gt_summary, coarse_summary, result_summary])
+    gt_summary = tf.summary.image("gt", next_masks * next_images)
+    result_summary = tf.summary.image("result", alpha_mattes * next_images)
+    images_summary = tf.summary.merge([image_summary, gt_summary, result_summary])
+
+    test_image_summary = tf.summary.image("test_image", test_images)
+    test_gt_summary = tf.summary.image("test_gt", test_masks * test_images)
+    test_result_summary = tf.summary.image("test_result", test_alpha_mattes * test_images)
+    test_images_summary = tf.summary.merge([test_image_summary, test_gt_summary, test_result_summary])
 
     loss_summary = tf.summary.scalar("loss", loss)
     test_loss_summary = tf.summary.scalar("test_loss", test_loss)
+
+    train_iou_sum = tf.summary.scalar("train_iou", train_iou)
+    test_iou_sum = tf.summary.scalar("test_iou", test_iou)
 
     saver = tf.train.Saver(var_list=tf.trainable_variables())
 
@@ -99,26 +102,19 @@ if __name__ == '__main__':
             it = resume + 1
 
         while not sess.should_stop():
-            train_op = train_op_first_stage_1
-
-            if it > 40000:
-                train_op = train_op_third_stage
-            elif it > 20000:
-                train_op = train_op_second_stage
-            elif it > 10000:
-                train_op = train_op_first_stage_2
-
-            _, cur_loss, cur_images_summary, cur_loss_summary = sess.run([train_op, loss, images_summary, loss_summary])
+            _, cur_loss, cur_images_summary, cur_loss_summary, cur_train_iou = sess.run([train_op, loss, images_summary, loss_summary, train_iou_sum])
             summary.add_summary(cur_loss_summary, it)
+            summary.add_summary(cur_train_iou, it)
 
-            if it % 100 == 0:
+            if it % 10 == 0:
                 summary.add_summary(cur_images_summary, it)
 
-            if it % 1000 == 0:
+            if it % 200 == 0:
                 sess.run(test_iterator.initializer)
-                cur_test_loss_summary = sess.run(test_loss_summary)
+                cur_test_loss_summary, cur_test_images_summary, cur_test_iou = sess.run([test_loss_summary, test_images_summary, test_iou_sum])
                 summary.add_summary(cur_test_loss_summary, it)
-
+                summary.add_summary(cur_test_images_summary, it)
+                summary.add_summary(cur_test_iou, it)
             summary.flush()
 
             if it % 5000 == 0:
@@ -129,8 +125,10 @@ if __name__ == '__main__':
             it += 1
 
         sess.run(test_iterator.initializer)
-        cur_test_loss_summary = sess.run(test_loss_summary)
+        cur_test_loss_summary, zzz = sess.run([test_loss_summary, test_images_summary])
         summary.add_summary(cur_test_loss_summary, it)
+
+        summary.add_summary(zzz, it)
 
         ckpt_path = saver.save(get_session(sess), save_path=os.path.join(args.ckpt_dir, "ckpt"), write_meta_graph=False,
                                global_step=it)
